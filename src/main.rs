@@ -11,8 +11,8 @@ use animation::{Animator, SLOW_DURATION};
 use controls::{col_move, row_move, ViewBasis};
 use cube::{Cube, Move};
 use render::{
-    draw_cube_state, draw_front_face_labels, draw_pins, sticker_screen_center, Blink, OrbitCamera,
-    PinAnchor,
+    draw_cube_state, draw_front_face_labels, draw_pins, sticker_screen_center, world_to_screen_3d,
+    Blink, OrbitCamera, PinAnchor,
 };
 use solver::AsyncSolver;
 
@@ -62,6 +62,8 @@ async fn main() {
     let mut camera = OrbitCamera::new();
     let mut rng = ::rand::thread_rng();
     let mut last_mouse: Option<Vec2> = None;
+    let mut left_mouse_down_prev = false;
+    let mut suppress_drag_until_mouse_up = false;
     let mut blink: Option<Blink> = None;
     let mut pins: Vec<PinAnchor> = Vec::new();
     // Every committed move is recorded here, kept around for diagnostics
@@ -172,7 +174,9 @@ async fn main() {
             shift_off_frames = shift_off_frames.saturating_add(1);
         }
         let shift_active = shift_off_frames < SHIFT_GRACE_FRAMES;
-        let ctrl_held = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        let ctrl_held = is_key_down(KeyCode::LeftControl)
+            || is_key_down(KeyCode::RightControl)
+            || raw_ctrl_down();
 
         if shift_active && is_key_pressed(KeyCode::R) {
             apply_ui_action(
@@ -245,11 +249,17 @@ async fn main() {
         }
 
         let current_mouse = Vec2::from(mouse_position());
+        let left_mouse_down = raw_left_mouse_down();
+        let left_mouse_pressed = is_mouse_button_pressed(MouseButton::Left)
+            || (left_mouse_down && !left_mouse_down_prev);
+        left_mouse_down_prev = left_mouse_down;
+        if !left_mouse_down {
+            suppress_drag_until_mouse_up = false;
+        }
+
         let pointer_over_ui = is_pointer_over_ui(open_menu);
-        let placing_pin = !pointer_over_ui
-            && is_key_down(KeyCode::F)
-            && is_mouse_button_pressed(MouseButton::Left)
-            && animator.is_idle();
+        let placing_pin =
+            !pointer_over_ui && is_key_down(KeyCode::F) && left_mouse_pressed && animator.is_idle();
         if placing_pin {
             if let Some(pin) = pick_front_pin(&cube, &camera.camera(), view, current_mouse) {
                 if !pins.contains(&pin) {
@@ -257,13 +267,55 @@ async fn main() {
                 }
             }
             last_mouse = None;
+            suppress_drag_until_mouse_up = true;
+        }
+        let ctrl_front_click = !pointer_over_ui && !placing_pin && ctrl_held && left_mouse_pressed;
+        let clicked_front_view = if ctrl_front_click {
+            pick_front_cell(&camera.camera(), view, current_mouse)
+        } else {
+            None
+        };
+        if let Some((col, row)) = clicked_front_view {
+            apply_ctrl_front_cell_command(&mut camera, col, row);
+            last_mouse = None;
+            suppress_drag_until_mouse_up = true;
+        }
+        let clicking_front_move = !pointer_over_ui
+            && !placing_pin
+            && clicked_front_view.is_none()
+            && !ctrl_held
+            && left_mouse_pressed
+            && animator.is_idle();
+        let clicked_front_move = if clicking_front_move {
+            pick_front_click_move(&camera.camera(), view, current_mouse, shift_active)
+        } else {
+            None
+        };
+        if let Some(mv) = clicked_front_move {
+            history.push(mv);
+            animator.push_many(std::iter::once(mv));
+            auto_shuffle = false;
+            solution = None;
+            last_mouse = None;
+            suppress_drag_until_mouse_up = true;
         }
         if pointer_over_ui {
             last_mouse = None;
-        } else if !placing_pin && is_mouse_button_pressed(MouseButton::Left) {
+        } else if !placing_pin
+            && !suppress_drag_until_mouse_up
+            && clicked_front_view.is_none()
+            && clicked_front_move.is_none()
+            && left_mouse_pressed
+        {
             last_mouse = Some(current_mouse);
         }
-        if !pointer_over_ui && !placing_pin && is_mouse_button_down(MouseButton::Left) {
+        if !pointer_over_ui
+            && !placing_pin
+            && !suppress_drag_until_mouse_up
+            && clicked_front_view.is_none()
+            && clicked_front_move.is_none()
+            && left_mouse_down
+        {
             if let Some(last) = last_mouse {
                 let delta = current_mouse - last;
                 camera.orbit(delta.x * 0.005, -delta.y * 0.005);
@@ -343,8 +395,13 @@ fn apply_ui_action(
             }
         }
         UiAction::AutoShuffle => {
-            *auto_shuffle = true;
-            *solution = None;
+            if *auto_shuffle {
+                *auto_shuffle = false;
+                animator.clear();
+            } else {
+                *auto_shuffle = true;
+                *solution = None;
+            }
         }
         UiAction::Solve => {
             if animator.is_idle()
@@ -435,6 +492,92 @@ fn pick_front_pin(
         }
     }
     best.map(|(_, pin)| pin)
+}
+
+fn pick_front_click_move(
+    camera: &Camera3D,
+    view: ViewBasis,
+    mouse: Vec2,
+    modifier: bool,
+) -> Option<Move> {
+    let (col, row) = pick_front_cell(camera, view, mouse)?;
+    front_cell_move(view, col, row, modifier)
+}
+
+fn pick_front_cell(camera: &Camera3D, view: ViewBasis, mouse: Vec2) -> Option<(i8, i8)> {
+    let mut best: Option<(f32, i8, i8)> = None;
+    for row in -1..=1 {
+        for col in -1..=1 {
+            let quad = front_cell_screen_quad(camera, view, col, row);
+            if !point_in_quad(mouse, quad) {
+                continue;
+            }
+            let center = (quad[0] + quad[1] + quad[2] + quad[3]) * 0.25;
+            let dist = center.distance(mouse);
+            if best.map_or(true, |(best_dist, _, _)| dist < best_dist) {
+                best = Some((dist, col, row));
+            }
+        }
+    }
+    best.map(|(_, col, row)| (col, row))
+}
+
+fn front_cell_move(view: ViewBasis, col: i8, row: i8, modifier: bool) -> Option<Move> {
+    if !modifier {
+        match col {
+            -1 => Some(row_move(view, row, false)),
+            1 => Some(row_move(view, row, true)),
+            _ => None,
+        }
+    } else {
+        match row {
+            -1 => Some(col_move(view, col, true)),
+            1 => Some(col_move(view, col, false)),
+            _ => None,
+        }
+    }
+}
+
+fn front_cell_screen_quad(camera: &Camera3D, view: ViewBasis, col: i8, row: i8) -> [Vec2; 4] {
+    let mut corners = [Vec2::ZERO; 4];
+    let offsets = [(-0.5f32, -0.5f32), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)];
+    for (i, (dx, dy)) in offsets.into_iter().enumerate() {
+        let mut p = [0.0f32; 3];
+        p[view.front_axis as usize] = view.front_sign as f32 * 1.485;
+        p[view.right_axis as usize] = (col as f32 + dx) * view.right_sign as f32;
+        p[view.up_axis as usize] = (row as f32 + dy) * view.up_sign as f32;
+        corners[i] = world_to_screen_3d(camera, vec3(p[0], p[1], p[2]));
+    }
+    corners
+}
+
+fn point_in_quad(point: Vec2, quad: [Vec2; 4]) -> bool {
+    point_in_triangle(point, quad[0], quad[1], quad[2])
+        || point_in_triangle(point, quad[0], quad[2], quad[3])
+}
+
+fn point_in_triangle(point: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    let d1 = cross2(point - a, b - a);
+    let d2 = cross2(point - b, c - b);
+    let d3 = cross2(point - c, a - c);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+fn cross2(a: Vec2, b: Vec2) -> f32 {
+    a.x * b.y - a.y * b.x
+}
+
+fn apply_ctrl_front_cell_command(camera: &mut OrbitCamera, col: i8, row: i8) {
+    const STEP: f32 = std::f32::consts::FRAC_PI_2;
+    match (col, row) {
+        (-1, 1) | (-1, 0) => camera.nudge_yaw(STEP),
+        (1, 1) | (1, 0) => camera.nudge_yaw(-STEP),
+        (0, 1) => camera.nudge_pitch(STEP),
+        (0, -1) => camera.nudge_pitch(-STEP),
+        _ => {}
+    }
 }
 
 fn axis_ivec(axis: u8, sign: i8) -> IVec3 {
@@ -756,6 +899,36 @@ extern "system" {
 #[cfg(target_os = "windows")]
 fn async_key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
+}
+
+#[cfg(target_os = "windows")]
+fn raw_left_mouse_down() -> bool {
+    is_mouse_button_down(MouseButton::Left) || native_left_mouse_down()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn raw_left_mouse_down() -> bool {
+    is_mouse_button_down(MouseButton::Left)
+}
+
+#[cfg(target_os = "windows")]
+fn native_left_mouse_down() -> bool {
+    async_key_down(0x01)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_left_mouse_down() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn raw_ctrl_down() -> bool {
+    async_key_down(0x11) || async_key_down(0xA2) || async_key_down(0xA3)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn raw_ctrl_down() -> bool {
+    false
 }
 
 /// Handle Ctrl + numpad view commands. Each press triggers a 90° rotation
