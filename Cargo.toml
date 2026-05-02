@@ -1,0 +1,13 @@
+[package]
+name = "cube-pilot"
+version = "0.6.0"
+edition = "2021"
+
+[dependencies]
+macroquad = "0.4"
+rand = "0.8"
+kociemba = "0.5.3"
+# Pin bincode to the RC version kociemba was built against; the final 2.0
+# release added a Context generic to the Decode trait that breaks both
+# kociemba and kewb.
+bincode = "=2.0.0-rc.3"
